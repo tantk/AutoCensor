@@ -11,8 +11,9 @@ a = Analysis(
     pathex=[],
     binaries=[],
     datas=[
-        # NudeNet ONNX model
+        # NudeNet ONNX models
         (os.path.join(site_packages, 'nudenet', '320n.onnx'), 'nudenet'),
+        ('C:\\dev\\vegas\\models\\640m.onnx', 'models'),
     ],
     hiddenimports=[
         'nudenet',

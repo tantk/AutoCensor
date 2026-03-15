@@ -72,7 +72,7 @@ class CensorApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Auto Censor")
-        self.root.geometry("620x780")
+        self.root.geometry("620x850")
         self.root.resizable(False, False)
 
         self.detector = None
@@ -81,8 +81,26 @@ class CensorApp:
         self._build_ui()
         self._init_detector()
 
+    def _get_model_path(self, model_name):
+        """Find model file bundled or next to exe/script."""
+        if model_name == "320n (fast)":
+            return None  # Use default bundled model
+        # Look for 640m.onnx next to exe or in models/ folder
+        for search_dir in [APP_DIR, os.path.join(APP_DIR, "models"),
+                           os.path.join(APP_DIR, "_internal"), os.path.join(APP_DIR, "_internal", "models")]:
+            path = os.path.join(search_dir, "640m.onnx")
+            if os.path.exists(path):
+                return path
+        return None
+
     def _init_detector(self):
-        self.detector = NudeDetector(providers=["CPUExecutionProvider"])
+        model = self.model_var.get() if hasattr(self, 'model_var') else "320n (fast)"
+        model_path = self._get_model_path(model)
+        if model_path:
+            self.detector = NudeDetector(model_path=model_path, inference_resolution=640,
+                                         providers=["CPUExecutionProvider"])
+        else:
+            self.detector = NudeDetector(providers=["CPUExecutionProvider"])
 
     def _build_ui(self):
         # --- File selection ---
@@ -93,6 +111,26 @@ class CensorApp:
         ttk.Entry(file_frame, textvariable=self.file_path, width=55).pack(side="left", padx=(0, 5))
         ttk.Button(file_frame, text="Browse", command=self._browse_file).pack(side="left")
 
+        # --- Model selection ---
+        model_frame = ttk.LabelFrame(self.root, text="Detection Model", padding=10)
+        model_frame.pack(fill="x", padx=10, pady=(5, 5))
+
+        model_row = ttk.Frame(model_frame)
+        model_row.pack(fill="x")
+
+        self.model_var = tk.StringVar(value="320n (fast)")
+        models = ["320n (fast)", "640m (accurate)"]
+        ttk.Label(model_row, text="Model:").pack(side="left")
+        self.model_combo = ttk.Combobox(model_row, textvariable=self.model_var, values=models,
+                                        state="readonly", width=20)
+        self.model_combo.pack(side="left", padx=(5, 10))
+        self.model_combo.bind("<<ComboboxSelected>>", self._on_model_change)
+
+        self.model_status = ttk.Label(model_row, text="", font=("Segoe UI", 8))
+        self.model_status.pack(side="left")
+
+        ttk.Label(model_frame, text="640m is slower but more accurate. Place 640m.onnx next to AutoCensor.exe.",
+                  font=("Segoe UI", 8)).pack(anchor="w")
 
         # --- Body parts selection ---
         parts_frame = ttk.LabelFrame(self.root, text="What to censor", padding=10)
@@ -207,6 +245,19 @@ class CensorApp:
 
         self.progress_bar = ttk.Progressbar(self.root, mode="determinate")
         self.progress_bar.pack(fill="x", padx=15, pady=(0, 10))
+
+    def _on_model_change(self, event=None):
+        model = self.model_var.get()
+        if model == "640m (accurate)":
+            path = self._get_model_path(model)
+            if not path:
+                self.model_status.config(text="640m.onnx not found!", foreground="red")
+                self.model_var.set("320n (fast)")
+                return
+        self.model_status.config(text="Loading...", foreground="gray")
+        self.root.update()
+        self._init_detector()
+        self.model_status.config(text="Ready", foreground="green")
 
     def _update_block_label(self, val):
         self.block_label.config(text=str(int(float(val))))
