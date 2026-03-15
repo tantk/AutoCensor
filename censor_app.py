@@ -16,6 +16,10 @@ from pathlib import Path
 import cv2
 import onnxruntime
 from nudenet import NudeDetector
+import mediapipe as mp
+from mediapipe.tasks.python import BaseOptions
+from mediapipe.tasks.python.vision import PoseLandmarker, PoseLandmarkerOptions, RunningMode
+from mediapipe import Image, ImageFormat
 
 # Use bundled ffmpeg if available
 APP_DIR = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, 'frozen', False) else __file__))
@@ -56,14 +60,25 @@ DEFAULT_CHECKED = [
 
 
 
-def apply_mosaic(image, x1, y1, x2, y2, block_size=10):
+def apply_mosaic(image, x1, y1, x2, y2, block_size=10, expand=0.3):
+    """Apply mosaic with optional region expansion (0.3 = 30% bigger each side)."""
+    img_h, img_w = image.shape[:2]
+    w = x2 - x1
+    h = y2 - y1
+    pad_x = int(w * expand)
+    pad_y = int(h * expand)
+    x1 = max(0, x1 - pad_x)
+    y1 = max(0, y1 - pad_y)
+    x2 = min(img_w, x2 + pad_x)
+    y2 = min(img_h, y2 + pad_y)
+
     region = image[y1:y2, x1:x2]
     if region.size == 0:
         return image
-    h, w = region.shape[:2]
-    small = cv2.resize(region, (max(1, w // block_size), max(1, h // block_size)),
+    rh, rw = region.shape[:2]
+    small = cv2.resize(region, (max(1, rw // block_size), max(1, rh // block_size)),
                        interpolation=cv2.INTER_LINEAR)
-    mosaic = cv2.resize(small, (w, h), interpolation=cv2.INTER_NEAREST)
+    mosaic = cv2.resize(small, (rw, rh), interpolation=cv2.INTER_NEAREST)
     image[y1:y2, x1:x2] = mosaic
     return image
 
@@ -72,7 +87,7 @@ class CensorApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Auto Censor")
-        self.root.geometry("620x850")
+        self.root.geometry("620x950")
         self.root.resizable(False, False)
 
         self.detector = None
@@ -93,6 +108,14 @@ class CensorApp:
                 return path
         return None
 
+    def _find_pose_model(self):
+        for search_dir in [APP_DIR, os.path.join(APP_DIR, "models"),
+                           os.path.join(APP_DIR, "_internal"), os.path.join(APP_DIR, "_internal", "models")]:
+            path = os.path.join(search_dir, "pose_landmarker_lite.task")
+            if os.path.exists(path):
+                return path
+        return None
+
     def _init_detector(self):
         model = self.model_var.get() if hasattr(self, 'model_var') else "320n (fast)"
         model_path = self._get_model_path(model)
@@ -101,6 +124,18 @@ class CensorApp:
                                          providers=["CPUExecutionProvider"])
         else:
             self.detector = NudeDetector(providers=["CPUExecutionProvider"])
+
+        # Init pose landmarker
+        pose_model = self._find_pose_model()
+        if pose_model:
+            options = PoseLandmarkerOptions(
+                base_options=BaseOptions(model_asset_path=pose_model),
+                running_mode=RunningMode.IMAGE,
+                num_poses=5
+            )
+            self.pose_landmarker = PoseLandmarker.create_from_options(options)
+        else:
+            self.pose_landmarker = None
 
     def _build_ui(self):
         # --- File selection ---
@@ -155,6 +190,25 @@ class CensorApp:
         ttk.Button(btn_row, text="Select All", command=self._select_all).pack(side="left", padx=5)
         ttk.Button(btn_row, text="Select None", command=self._select_none).pack(side="left", padx=5)
         ttk.Button(btn_row, text="Exposed Only", command=self._select_exposed).pack(side="left", padx=5)
+
+        # --- Pose-based censoring ---
+        pose_frame = ttk.LabelFrame(self.root, text="Pose-Based Censoring (body tracking)", padding=10)
+        pose_frame.pack(fill="x", padx=10, pady=5)
+
+        self.pose_crotch = tk.BooleanVar(value=False)
+        ttk.Checkbutton(pose_frame, text="Censor crotch area (tracks hip skeleton)",
+                        variable=self.pose_crotch).pack(anchor="w")
+
+        self.pose_chest = tk.BooleanVar(value=False)
+        ttk.Checkbutton(pose_frame, text="Censor chest area (tracks shoulder skeleton)",
+                        variable=self.pose_chest).pack(anchor="w")
+
+        self.pose_butt = tk.BooleanVar(value=False)
+        ttk.Checkbutton(pose_frame, text="Censor butt area (tracks hip skeleton, rear)",
+                        variable=self.pose_butt).pack(anchor="w")
+
+        ttk.Label(pose_frame, text="Uses body skeleton tracking — more reliable than AI detection for constant exposure.",
+                  font=("Segoe UI", 8)).pack(anchor="w", pady=(3, 0))
 
         # --- Mosaic settings ---
         mosaic_frame = ttk.LabelFrame(self.root, text="Mosaic Settings", padding=10)
@@ -378,6 +432,118 @@ class CensorApp:
             self.processing = False
             self.root.after(0, lambda: self.run_btn.config(state="normal"))
 
+    def _get_all_poses(self, image_path):
+        """Get all pose skeletons from image. Returns list of (hip_center, pose_data) tuples."""
+        if not self.pose_landmarker:
+            return []
+        image = cv2.imread(image_path)
+        h, w = image.shape[:2]
+        mp_image = Image(image_format=ImageFormat.SRGB, data=cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+        results = self.pose_landmarker.detect(mp_image)
+
+        poses = []
+        for pose in results.pose_landmarks:
+            left_hip = pose[23]
+            right_hip = pose[24]
+            cx = (left_hip.x + right_hip.x) / 2 * w
+            cy = (left_hip.y + right_hip.y) / 2 * h
+            poses.append({"cx": cx, "cy": cy, "landmarks": pose, "w": w, "h": h})
+        return poses
+
+    def _pose_to_boxes(self, pose_data):
+        """Convert a pose skeleton to censor boxes based on selected regions."""
+        boxes = []
+        pose = pose_data["landmarks"]
+        w, h = pose_data["w"], pose_data["h"]
+
+        left_hip = pose[23]
+        right_hip = pose[24]
+        left_knee = pose[25]
+        left_shoulder = pose[11]
+        right_shoulder = pose[12]
+
+        do_crotch = self.pose_crotch.get()
+        do_chest = self.pose_chest.get()
+        do_butt = self.pose_butt.get()
+
+        if do_crotch or do_butt:
+            cx = int((left_hip.x + right_hip.x) / 2 * w)
+            cy = int((left_hip.y + right_hip.y) / 2 * h)
+            hip_width = max(abs(int((left_hip.x - right_hip.x) * w)), 30)
+            thigh_len = max(abs(int((left_knee.y - left_hip.y) * h)), 40)
+            pad = int(hip_width * 0.4)
+
+            if do_crotch:
+                x1 = cx - hip_width // 2 - pad
+                y1 = cy - pad
+                x2 = cx + hip_width // 2 + pad
+                y2 = cy + int(thigh_len * 0.5) + pad
+                boxes.append([max(0, x1), max(0, y1), min(w, x2) - max(0, x1), min(h, y2) - max(0, y1)])
+
+            if do_butt:
+                x1 = cx - hip_width // 2 - pad
+                y1 = cy - int(thigh_len * 0.2)
+                x2 = cx + hip_width // 2 + pad
+                y2 = cy + int(thigh_len * 0.4) + pad
+                boxes.append([max(0, x1), max(0, y1), min(w, x2) - max(0, x1), min(h, y2) - max(0, y1)])
+
+        if do_chest:
+            scx = int((left_shoulder.x + right_shoulder.x) / 2 * w)
+            scy = int((left_shoulder.y + right_shoulder.y) / 2 * h)
+            shoulder_width = max(abs(int((left_shoulder.x - right_shoulder.x) * w)), 30)
+            torso_len = max(abs(int((left_hip.y - left_shoulder.y) * h)), 40)
+            spad = int(shoulder_width * 0.2)
+
+            x1 = scx - shoulder_width // 2 - spad
+            y1 = scy - spad
+            x2 = scx + shoulder_width // 2 + spad
+            y2 = scy + int(torso_len * 0.5)
+            boxes.append([max(0, x1), max(0, y1), min(w, x2) - max(0, x1), min(h, y2) - max(0, y1)])
+
+        return boxes
+
+    def _get_pose_boxes(self, image_path):
+        """Simple mode: censor all detected poses (used for images)."""
+        poses = self._get_all_poses(image_path)
+        boxes = []
+        for p in poses:
+            boxes += self._pose_to_boxes(p)
+        return boxes
+
+    def _match_nudenet_to_pose(self, nudenet_boxes, poses, img_w, img_h):
+        """Find which poses have a NudeNet detection overlapping their hip area.
+        Returns set of pose indices that are flagged as nude."""
+        flagged = set()
+        for nb in nudenet_boxes:
+            nx, ny, nw, nh = nb
+            ncx = nx + nw / 2
+            ncy = ny + nh / 2
+            best_dist = float('inf')
+            best_idx = -1
+            for idx, p in enumerate(poses):
+                dist = ((p["cx"] - ncx) ** 2 + (p["cy"] - ncy) ** 2) ** 0.5
+                if dist < best_dist:
+                    best_dist = dist
+                    best_idx = idx
+            # Match if detection is within reasonable distance of hip center
+            threshold = max(img_w, img_h) * 0.2
+            if best_idx >= 0 and best_dist < threshold:
+                flagged.add(best_idx)
+        return flagged
+
+    def _find_closest_pose(self, prev_cx, prev_cy, poses, scene_threshold):
+        """Find the pose closest to previous position. Returns index or -1 if scene change."""
+        best_dist = float('inf')
+        best_idx = -1
+        for idx, p in enumerate(poses):
+            dist = ((p["cx"] - prev_cx) ** 2 + (p["cy"] - prev_cy) ** 2) ** 0.5
+            if dist < best_dist:
+                best_dist = dist
+                best_idx = idx
+        if best_idx >= 0 and best_dist < scene_threshold:
+            return best_idx
+        return -1  # Scene change or lost tracking
+
     def _detect_frame(self, image_path, classes, min_confidence):
         """Return list of [x, y, w, h] boxes for matching detections."""
         detections = self.detector.detect(image_path)
@@ -389,7 +555,8 @@ class CensorApp:
 
     def _censor_frame(self, image_path, output_path, classes, block_size, min_confidence):
         boxes = self._detect_frame(image_path, classes, min_confidence)
-        self._apply_boxes(image_path, output_path, boxes, block_size)
+        pose_boxes = self._get_pose_boxes(image_path)
+        self._apply_boxes(image_path, output_path, boxes + pose_boxes, block_size)
 
     def _apply_boxes(self, image_path, output_path, boxes, block_size):
         image = cv2.imread(image_path)
@@ -458,38 +625,74 @@ class CensorApp:
                 censor_start = int(start_sec * fps) + 1 if start_sec is not None else 1
                 censor_end = int(end_sec * fps) + 1 if end_sec is not None else total
 
-            if classes:
-                # Pass 1: Detect all frames in range
-                self._update_status("Pass 1: Detecting...")
-                all_boxes = []
-                for i, frame in enumerate(frames, 1):
-                    if censor_start <= i <= censor_end:
-                        boxes = self._detect_frame(str(frame), classes, min_confidence)
-                        all_boxes.append(boxes)
-                        self._update_status(f"Detecting frame {i}/{total}...")
-                    else:
-                        all_boxes.append([])
-                    self._update_progress(int(i / total * 45))
+            use_pose = self.pose_crotch.get() or self.pose_chest.get() or self.pose_butt.get()
 
-                # Smooth detections to fill gaps
-                all_boxes = self._smooth_detections(all_boxes)
+            # Smart tracking: NudeNet triggers, pose takes over
+            # tracked_people: dict of track_id -> {"cx": float, "cy": float}
+            tracked_people = {}
+            next_track_id = 0
+            scene_threshold = max(1920, 1080) * 0.15  # 15% of frame = scene change
 
-                # Pass 2: Apply censoring
-                self._update_status("Pass 2: Applying mosaic...")
-                for i, frame in enumerate(frames, 1):
-                    out_frame = os.path.join(censored_dir, frame.name)
-                    if all_boxes[i - 1]:
-                        self._apply_boxes(str(frame), out_frame, all_boxes[i - 1], block_size)
-                        self._update_status(f"Censoring frame {i}/{total}...")
-                    else:
-                        shutil.copy2(str(frame), out_frame)
-                    self._update_progress(45 + int(i / total * 45))
-            else:
-                # No classes selected — just copy frames
-                for i, frame in enumerate(frames, 1):
-                    out_frame = os.path.join(censored_dir, frame.name)
+            for i, frame in enumerate(frames, 1):
+                out_frame = os.path.join(censored_dir, frame.name)
+                in_range = censor_start <= i <= censor_end
+
+                if not in_range:
                     shutil.copy2(str(frame), out_frame)
                     self._update_progress(int(i / total * 90))
+                    continue
+
+                frame_path = str(frame)
+                all_frame_boxes = []
+
+                # Step 1: NudeNet detection
+                if classes:
+                    nudenet_boxes = self._detect_frame(frame_path, classes, min_confidence)
+                    all_frame_boxes += nudenet_boxes
+                else:
+                    nudenet_boxes = []
+
+                # Step 2: Pose tracking
+                if use_pose:
+                    poses = self._get_all_poses(frame_path)
+                    img = cv2.imread(frame_path)
+                    img_h, img_w = img.shape[:2] if img is not None else (1080, 1920)
+
+                    # Match NudeNet detections to poses — flag new nude people
+                    if nudenet_boxes and poses:
+                        flagged_indices = self._match_nudenet_to_pose(nudenet_boxes, poses, img_w, img_h)
+                        for idx in flagged_indices:
+                            p = poses[idx]
+                            # Check if already tracked
+                            already_tracked = False
+                            for tid, tp in tracked_people.items():
+                                dist = ((tp["cx"] - p["cx"]) ** 2 + (tp["cy"] - p["cy"]) ** 2) ** 0.5
+                                if dist < scene_threshold:
+                                    already_tracked = True
+                                    break
+                            if not already_tracked:
+                                tracked_people[next_track_id] = {"cx": p["cx"], "cy": p["cy"]}
+                                next_track_id += 1
+
+                    # Update tracked people positions and generate pose boxes
+                    new_tracked = {}
+                    for tid, tp in tracked_people.items():
+                        match_idx = self._find_closest_pose(tp["cx"], tp["cy"], poses, scene_threshold)
+                        if match_idx >= 0:
+                            p = poses[match_idx]
+                            new_tracked[tid] = {"cx": p["cx"], "cy": p["cy"]}
+                            all_frame_boxes += self._pose_to_boxes(p)
+                    tracked_people = new_tracked
+
+                # Apply all boxes
+                if all_frame_boxes:
+                    self._apply_boxes(frame_path, out_frame, all_frame_boxes, block_size)
+                    self._update_status(f"Censoring frame {i}/{total} ({len(tracked_people)} tracked)...")
+                else:
+                    shutil.copy2(frame_path, out_frame)
+                    self._update_status(f"Frame {i}/{total}...")
+
+                self._update_progress(int(i / total * 90))
 
             self._update_status("Reassembling video...")
             reassemble_cmd = [
