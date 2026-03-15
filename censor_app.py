@@ -327,16 +327,53 @@ class CensorApp:
             self.processing = False
             self.root.after(0, lambda: self.run_btn.config(state="normal"))
 
-    def _censor_frame(self, image_path, output_path, classes, block_size, min_confidence):
+    def _detect_frame(self, image_path, classes, min_confidence):
+        """Return list of [x, y, w, h] boxes for matching detections."""
         detections = self.detector.detect(image_path)
-        image = cv2.imread(image_path)
-
+        boxes = []
         for det in detections:
             if det["class"] in classes and det["score"] >= min_confidence:
-                x, y, w, h = [int(c) for c in det["box"]]
-                image = apply_mosaic(image, x, y, x + w, y + h, block_size)
+                boxes.append([int(c) for c in det["box"]])
+        return boxes
 
+    def _censor_frame(self, image_path, output_path, classes, block_size, min_confidence):
+        boxes = self._detect_frame(image_path, classes, min_confidence)
+        self._apply_boxes(image_path, output_path, boxes, block_size)
+
+    def _apply_boxes(self, image_path, output_path, boxes, block_size):
+        image = cv2.imread(image_path)
+        for x, y, w, h in boxes:
+            image = apply_mosaic(image, x, y, x + w, y + h, block_size)
         cv2.imwrite(output_path, image)
+
+    def _smooth_detections(self, all_boxes, window=5):
+        """Fill gaps in detections. If frame N has no boxes but nearby frames do, interpolate."""
+        smoothed = [list(b) for b in all_boxes]
+        total = len(smoothed)
+
+        for i in range(total):
+            if smoothed[i]:
+                continue
+            # Look backward and forward for nearest detections
+            prev_boxes = None
+            next_boxes = None
+            for back in range(1, window + 1):
+                if i - back >= 0 and all_boxes[i - back]:
+                    prev_boxes = all_boxes[i - back]
+                    break
+            for fwd in range(1, window + 1):
+                if i + fwd < total and all_boxes[i + fwd]:
+                    next_boxes = all_boxes[i + fwd]
+                    break
+            # If both neighbors have detections, use the closer one
+            if prev_boxes and next_boxes:
+                smoothed[i] = prev_boxes
+            elif prev_boxes:
+                smoothed[i] = prev_boxes
+            elif next_boxes:
+                smoothed[i] = next_boxes
+
+        return smoothed
 
     def _process_video(self, input_path, output_path, classes, block_size, min_confidence, start_sec=None, end_sec=None, trim=False):
         frames_dir = tempfile.mkdtemp(prefix="frames_")
@@ -362,30 +399,45 @@ class CensorApp:
             frames = sorted(Path(frames_dir).glob("*.jpg"))
             total = len(frames)
 
+            # Determine which frames to censor
             if trim:
-                # All extracted frames are in range
-                for i, frame in enumerate(frames, 1):
-                    out_frame = os.path.join(censored_dir, frame.name)
-                    if classes:
-                        self._censor_frame(str(frame), out_frame, classes, block_size, min_confidence)
-                        self._update_status(f"Censoring frame {i}/{total}...")
-                    else:
-                        shutil.copy2(str(frame), out_frame)
-                        self._update_status(f"Processing frame {i}/{total}...")
-                    self._update_progress(int(i / total * 90))
+                censor_start = 1
+                censor_end = total
             else:
-                # Full video — censor only the range
-                start_frame = int(start_sec * fps) + 1 if start_sec is not None else 1
-                end_frame = int(end_sec * fps) + 1 if end_sec is not None else float('inf')
+                censor_start = int(start_sec * fps) + 1 if start_sec is not None else 1
+                censor_end = int(end_sec * fps) + 1 if end_sec is not None else total
 
+            if classes:
+                # Pass 1: Detect all frames in range
+                self._update_status("Pass 1: Detecting...")
+                all_boxes = []
+                for i, frame in enumerate(frames, 1):
+                    if censor_start <= i <= censor_end:
+                        boxes = self._detect_frame(str(frame), classes, min_confidence)
+                        all_boxes.append(boxes)
+                        self._update_status(f"Detecting frame {i}/{total}...")
+                    else:
+                        all_boxes.append([])
+                    self._update_progress(int(i / total * 45))
+
+                # Smooth detections to fill gaps
+                all_boxes = self._smooth_detections(all_boxes)
+
+                # Pass 2: Apply censoring
+                self._update_status("Pass 2: Applying mosaic...")
                 for i, frame in enumerate(frames, 1):
                     out_frame = os.path.join(censored_dir, frame.name)
-                    if start_frame <= i <= end_frame and classes:
-                        self._censor_frame(str(frame), out_frame, classes, block_size, min_confidence)
+                    if all_boxes[i - 1]:
+                        self._apply_boxes(str(frame), out_frame, all_boxes[i - 1], block_size)
                         self._update_status(f"Censoring frame {i}/{total}...")
                     else:
                         shutil.copy2(str(frame), out_frame)
-                        self._update_status(f"Copying frame {i}/{total}...")
+                    self._update_progress(45 + int(i / total * 45))
+            else:
+                # No classes selected — just copy frames
+                for i, frame in enumerate(frames, 1):
+                    out_frame = os.path.join(censored_dir, frame.name)
+                    shutil.copy2(str(frame), out_frame)
                     self._update_progress(int(i / total * 90))
 
             self._update_status("Reassembling video...")
