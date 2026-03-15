@@ -1,0 +1,11 @@
+build/
+dist/
+__pycache__/
+*.spec
+*.pyc
+*.png
+*.jpg
+*.jpeg
+*.mp4
+*.avi
+*.mkv
