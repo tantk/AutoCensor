@@ -14,24 +14,13 @@ import shutil
 from pathlib import Path
 
 import cv2
-
-# Suppress CUDA DLL load errors on systems without CUDA installed
-os.environ.setdefault("ORT_CUDA_UNAVAILABLE_OK", "1")
-try:
-    import onnxruntime
-except OSError:
-    # CUDA DLLs missing — force CPU-only mode
-    os.environ["CUDA_VISIBLE_DEVICES"] = ""
-    import onnxruntime
-
+import onnxruntime
 from nudenet import NudeDetector
 
 # Use bundled ffmpeg if available
 APP_DIR = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, 'frozen', False) else __file__))
 _ffmpeg_local = os.path.join(APP_DIR, "ffmpeg.exe")
-_ffprobe_local = os.path.join(APP_DIR, "ffprobe.exe")
 FFMPEG = _ffmpeg_local if os.path.exists(_ffmpeg_local) else "ffmpeg"
-FFPROBE = _ffprobe_local if os.path.exists(_ffprobe_local) else "ffprobe"
 
 
 # --- Detection classes ---
@@ -65,14 +54,6 @@ DEFAULT_CHECKED = [
 ]
 
 
-def get_gpu_provider():
-    try:
-        providers = onnxruntime.get_available_providers()
-        if "CUDAExecutionProvider" in providers:
-            return [("CUDAExecutionProvider", {"device_id": 0}), "CPUExecutionProvider"]
-    except Exception:
-        pass
-    return ["CPUExecutionProvider"]
 
 
 def apply_mosaic(image, x1, y1, x2, y2, block_size=10):
@@ -91,7 +72,7 @@ class CensorApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Auto Censor")
-        self.root.geometry("620x700")
+        self.root.geometry("620x780")
         self.root.resizable(False, False)
 
         self.detector = None
@@ -101,24 +82,7 @@ class CensorApp:
         self._init_detector()
 
     def _init_detector(self):
-        providers = get_gpu_provider()
-        provider_names = []
-        for p in providers:
-            if isinstance(p, tuple):
-                provider_names.append(p[0])
-            else:
-                provider_names.append(p)
-
-        try:
-            self.detector = NudeDetector(providers=providers)
-            if "CUDAExecutionProvider" in provider_names:
-                self.gpu_label.config(text="GPU: CUDA (NVIDIA)", foreground="green")
-            else:
-                self.gpu_label.config(text="GPU: Not available (using CPU)", foreground="red")
-        except Exception:
-            # CUDA init failed, fall back to CPU
-            self.detector = NudeDetector(providers=["CPUExecutionProvider"])
-            self.gpu_label.config(text="GPU: Failed to init, using CPU", foreground="orange")
+        self.detector = NudeDetector(providers=["CPUExecutionProvider"])
 
     def _build_ui(self):
         # --- File selection ---
@@ -129,9 +93,6 @@ class CensorApp:
         ttk.Entry(file_frame, textvariable=self.file_path, width=55).pack(side="left", padx=(0, 5))
         ttk.Button(file_frame, text="Browse", command=self._browse_file).pack(side="left")
 
-        # --- GPU status ---
-        self.gpu_label = ttk.Label(self.root, text="GPU: Detecting...", font=("Segoe UI", 9))
-        self.gpu_label.pack(anchor="w", padx=15)
 
         # --- Body parts selection ---
         parts_frame = ttk.LabelFrame(self.root, text="What to censor", padding=10)
@@ -175,6 +136,46 @@ class CensorApp:
 
         ttk.Label(mosaic_frame, text="(Higher = more pixelated)", font=("Segoe UI", 8)).pack(anchor="w")
 
+        # --- Video time range ---
+        self.time_frame = ttk.LabelFrame(self.root, text="Video Time Range", padding=10)
+        self.time_frame.pack(fill="x", padx=10, pady=5)
+
+        # Start slider
+        start_row = ttk.Frame(self.time_frame)
+        start_row.pack(fill="x", pady=(0, 3))
+        ttk.Label(start_row, text="Start:", width=5).pack(side="left")
+        self.start_val = tk.DoubleVar(value=0)
+        self.start_slider = ttk.Scale(start_row, from_=0, to=100, variable=self.start_val,
+                                      orient="horizontal", command=self._update_start_label)
+        self.start_slider.pack(side="left", fill="x", expand=True, padx=(0, 5))
+        self.start_label = ttk.Label(start_row, text="00:00", width=8)
+        self.start_label.pack(side="left")
+
+        # End slider
+        end_row = ttk.Frame(self.time_frame)
+        end_row.pack(fill="x")
+        ttk.Label(end_row, text="End:", width=5).pack(side="left")
+        self.end_val = tk.DoubleVar(value=100)
+        self.end_slider = ttk.Scale(end_row, from_=0, to=100, variable=self.end_val,
+                                    orient="horizontal", command=self._update_end_label)
+        self.end_slider.pack(side="left", fill="x", expand=True, padx=(0, 5))
+        self.end_label = ttk.Label(end_row, text="00:00", width=8)
+        self.end_label.pack(side="left")
+
+        self.video_duration = 0
+        self.video_fps = 30
+
+        # Trim checkbox
+        self.trim_video = tk.BooleanVar(value=False)
+        ttk.Checkbutton(self.time_frame, text="Output selected range only (trim)",
+                        variable=self.trim_video).pack(anchor="w", pady=(5, 0))
+
+        ttk.Label(self.time_frame, text="(Load a video to enable. Drag sliders to set range.)",
+                  font=("Segoe UI", 8)).pack(anchor="w", pady=(3, 0))
+        # Disable until video loaded
+        self.start_slider.config(state="disabled")
+        self.end_slider.config(state="disabled")
+
         # --- Confidence threshold ---
         conf_frame = ttk.LabelFrame(self.root, text="Detection Confidence", padding=10)
         conf_frame.pack(fill="x", padx=10, pady=5)
@@ -213,6 +214,23 @@ class CensorApp:
     def _update_conf_label(self, val):
         self.conf_label.config(text=f"{float(val):.2f}")
 
+    def _format_time(self, seconds):
+        seconds = max(0, seconds)
+        h = int(seconds // 3600)
+        m = int((seconds % 3600) // 60)
+        s = int(seconds % 60)
+        if h > 0:
+            return f"{h}:{m:02d}:{s:02d}"
+        return f"{m:02d}:{s:02d}"
+
+    def _update_start_label(self, val):
+        sec = float(val) / 100 * self.video_duration
+        self.start_label.config(text=self._format_time(sec))
+
+    def _update_end_label(self, val):
+        sec = float(val) / 100 * self.video_duration
+        self.end_label.config(text=self._format_time(sec))
+
     def _browse_file(self):
         path = filedialog.askopenfilename(
             filetypes=[
@@ -223,6 +241,25 @@ class CensorApp:
         )
         if path:
             self.file_path.set(path)
+            if self._is_video(path):
+                cap = cv2.VideoCapture(path)
+                self.video_fps = cap.get(cv2.CAP_PROP_FPS) or 30
+                frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+                self.video_duration = frame_count / self.video_fps
+                cap.release()
+
+                self.start_slider.config(state="normal")
+                self.end_slider.config(state="normal")
+                self.start_val.set(0)
+                self.end_val.set(100)
+                self.start_label.config(text=self._format_time(0))
+                self.end_label.config(text=self._format_time(self.video_duration))
+                self.time_frame.config(text=f"Video Time Range ({self._format_time(self.video_duration)} total)")
+            else:
+                self.start_slider.config(state="disabled")
+                self.end_slider.config(state="disabled")
+                self.video_duration = 0
+                self.time_frame.config(text="Video Time Range")
 
     def _select_all(self):
         for var in self.class_vars.values():
@@ -253,9 +290,6 @@ class CensorApp:
             return
 
         classes = self._get_selected_classes()
-        if not classes:
-            messagebox.showerror("Error", "Please select at least one body part to censor.")
-            return
 
         self.processing = True
         self.run_btn.config(state="disabled")
@@ -271,7 +305,12 @@ class CensorApp:
             output_path = f"{name}_censored{ext}"
 
             if self._is_video(input_path):
-                self._process_video(input_path, output_path, classes, block_size, min_confidence)
+                start_pct = self.start_val.get()
+                end_pct = self.end_val.get()
+                start_sec = start_pct / 100 * self.video_duration if start_pct > 0 else None
+                end_sec = end_pct / 100 * self.video_duration if end_pct < 100 else None
+                trim = self.trim_video.get()
+                self._process_video(input_path, output_path, classes, block_size, min_confidence, start_sec, end_sec, trim)
             else:
                 self._update_status("Processing image...")
                 self._censor_frame(input_path, output_path, classes, block_size, min_confidence)
@@ -299,47 +338,89 @@ class CensorApp:
 
         cv2.imwrite(output_path, image)
 
-    def _process_video(self, input_path, output_path, classes, block_size, min_confidence):
+    def _process_video(self, input_path, output_path, classes, block_size, min_confidence, start_sec=None, end_sec=None, trim=False):
         frames_dir = tempfile.mkdtemp(prefix="frames_")
         censored_dir = tempfile.mkdtemp(prefix="censored_")
 
         try:
+            # Extract frames (trimmed or full)
             self._update_status("Extracting frames...")
-            subprocess.run([
-                FFMPEG, "-i", input_path,
-                "-qscale:v", "2",
-                os.path.join(frames_dir, "frame_%06d.jpg")
-            ], check=True, capture_output=True)
+            extract_cmd = [FFMPEG]
+            if trim and start_sec is not None:
+                extract_cmd += ["-ss", str(start_sec)]
+            if trim and end_sec is not None:
+                duration = end_sec - (start_sec or 0)
+                extract_cmd += ["-t", str(duration)]
+            extract_cmd += ["-i", input_path, "-qscale:v", "2",
+                           os.path.join(frames_dir, "frame_%06d.jpg")]
+            subprocess.run(extract_cmd, check=True, capture_output=True)
+
+            cap = cv2.VideoCapture(input_path)
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            cap.release()
 
             frames = sorted(Path(frames_dir).glob("*.jpg"))
             total = len(frames)
 
-            for i, frame in enumerate(frames, 1):
-                out_frame = os.path.join(censored_dir, frame.name)
-                self._censor_frame(str(frame), out_frame, classes, block_size, min_confidence)
-                pct = int(i / total * 90)
-                self._update_progress(pct)
-                self._update_status(f"Processing frame {i}/{total}...")
+            if trim:
+                # All extracted frames are in range
+                for i, frame in enumerate(frames, 1):
+                    out_frame = os.path.join(censored_dir, frame.name)
+                    if classes:
+                        self._censor_frame(str(frame), out_frame, classes, block_size, min_confidence)
+                        self._update_status(f"Censoring frame {i}/{total}...")
+                    else:
+                        shutil.copy2(str(frame), out_frame)
+                        self._update_status(f"Processing frame {i}/{total}...")
+                    self._update_progress(int(i / total * 90))
+            else:
+                # Full video — censor only the range
+                start_frame = int(start_sec * fps) + 1 if start_sec is not None else 1
+                end_frame = int(end_sec * fps) + 1 if end_sec is not None else float('inf')
 
-            fps_result = subprocess.run([
-                FFPROBE, "-v", "0", "-select_streams", "v:0",
-                "-show_entries", "stream=r_frame_rate",
-                "-of", "csv=p=0", input_path
-            ], capture_output=True, text=True)
-            fps = fps_result.stdout.strip()
+                for i, frame in enumerate(frames, 1):
+                    out_frame = os.path.join(censored_dir, frame.name)
+                    if start_frame <= i <= end_frame and classes:
+                        self._censor_frame(str(frame), out_frame, classes, block_size, min_confidence)
+                        self._update_status(f"Censoring frame {i}/{total}...")
+                    else:
+                        shutil.copy2(str(frame), out_frame)
+                        self._update_status(f"Copying frame {i}/{total}...")
+                    self._update_progress(int(i / total * 90))
 
             self._update_status("Reassembling video...")
-            subprocess.run([
+            reassemble_cmd = [
                 FFMPEG, "-y",
-                "-framerate", fps,
+                "-framerate", str(fps),
                 "-i", os.path.join(censored_dir, "frame_%06d.jpg"),
-                "-i", input_path,
-                "-map", "0:v", "-map", "1:a?",
+            ]
+
+            if trim and (start_sec is not None or end_sec is not None):
+                # Extract matching audio segment
+                audio_file = os.path.join(frames_dir, "audio.aac")
+                audio_cmd = [FFMPEG, "-y", "-i", input_path]
+                if start_sec is not None:
+                    audio_cmd += ["-ss", str(start_sec)]
+                if end_sec is not None:
+                    audio_cmd += ["-t", str(end_sec - (start_sec or 0))]
+                audio_cmd += ["-vn", "-acodec", "copy", audio_file]
+                subprocess.run(audio_cmd, capture_output=True)
+
+                if os.path.exists(audio_file) and os.path.getsize(audio_file) > 0:
+                    reassemble_cmd += ["-i", audio_file, "-map", "0:v", "-map", "1:a"]
+                else:
+                    reassemble_cmd += ["-map", "0:v"]
+            else:
+                reassemble_cmd += ["-i", input_path, "-map", "0:v", "-map", "1:a?"]
+
+            reassemble_cmd += [
                 "-c:v", "libx264", "-preset", "medium", "-crf", "18",
                 "-c:a", "copy",
                 "-pix_fmt", "yuv420p",
+                "-shortest",
                 output_path
-            ], check=True, capture_output=True)
+            ]
+            subprocess.run(reassemble_cmd, check=True, capture_output=True)
 
             self._update_progress(100)
             self._update_status(f"Done! Saved: {output_path}")
